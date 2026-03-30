@@ -82,8 +82,13 @@ func (m *ingestService) protocolProcessorsEligibleForProduction(ctx context.Cont
 // token changes, and cursor update. Channel unlock is a no-op when chAccStore is nil.
 func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32, buffer *indexer.IndexerBuffer, cursorName string) (int, int, error) {
 	var numTxs, numOps int
+	// Track protocols that persisted current state in this transaction attempt
+	// so we can reset their cache-loaded flag on rollback.
+	var currentStatePersistedProtocols []string
 
 	err := db.RunInPgxTransaction(ctx, m.models.DB, func(dbTx pgx.Tx) error {
+		currentStatePersistedProtocols = currentStatePersistedProtocols[:0]
+
 		// 1. Insert unique trustline assets (FK prerequisite for trustline balances)
 		uniqueAssets := buffer.GetUniqueTrustlineAssets()
 		if len(uniqueAssets) > 0 {
@@ -179,12 +184,25 @@ func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32,
 					return fmt.Errorf("CAS current state cursor for %s: %w", protocolID, casErr)
 				}
 				if swapped {
+					// On first CAS success (handoff from migration), load current state
+					// from DB into processor memory. Subsequent ledgers use the in-memory
+					// state maintained by PersistCurrentState (write-through cache).
+					if !m.protocolCurrentStateLoaded[protocolID] {
+						loadStart := time.Now()
+						if loadErr := processor.LoadCurrentState(ctx, dbTx); loadErr != nil {
+							return fmt.Errorf("loading current state for %s at ledger %d: %w", protocolID, ledgerSeq, loadErr)
+						}
+						m.metricsService.ObserveProtocolStateProcessingDuration(protocolID, "load_current_state", time.Since(loadStart).Seconds())
+						m.protocolCurrentStateLoaded[protocolID] = true
+					}
+
 					start := time.Now()
 					persistErr := processor.PersistCurrentState(ctx, dbTx)
 					m.metricsService.ObserveProtocolStateProcessingDuration(protocolID, "persist_current_state", time.Since(start).Seconds())
 					if persistErr != nil {
 						return fmt.Errorf("persisting current state for %s at ledger %d: %w", protocolID, ledgerSeq, persistErr)
 					}
+					currentStatePersistedProtocols = append(currentStatePersistedProtocols, protocolID)
 				}
 			}
 		}
@@ -197,6 +215,12 @@ func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32,
 		return nil
 	})
 	if err != nil {
+		// Transaction rolled back — processor in-memory state may be stale from
+		// the failed PersistCurrentState call. Reset loaded flags to force a
+		// DB reload on the next successful CAS attempt.
+		for _, pid := range currentStatePersistedProtocols {
+			m.protocolCurrentStateLoaded[pid] = false
+		}
 		return 0, 0, fmt.Errorf("persisting ledger data for ledger %d: %w", ledgerSeq, err)
 	}
 

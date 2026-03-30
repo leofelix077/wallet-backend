@@ -2701,9 +2701,10 @@ func Test_ingestService_processBackfillBatchesParallel_BothModes(t *testing.T) {
 // values into ingest_store within the DB transaction, proving PersistHistory
 // and PersistCurrentState were called and committed atomically.
 type testProtocolProcessor struct {
-	id              string
-	processedLedger uint32
-	ingestStore     *data.IngestStoreModel
+	id                    string
+	processedLedger       uint32
+	ingestStore           *data.IngestStoreModel
+	loadCurrentStateCalls int
 }
 
 func (p *testProtocolProcessor) ProtocolID() string { return p.id }
@@ -2719,6 +2720,11 @@ func (p *testProtocolProcessor) PersistHistory(ctx context.Context, dbTx pgx.Tx)
 
 func (p *testProtocolProcessor) PersistCurrentState(ctx context.Context, dbTx pgx.Tx) error {
 	return p.ingestStore.Update(ctx, dbTx, fmt.Sprintf("test_%s_current_state_written", p.id), p.processedLedger)
+}
+
+func (p *testProtocolProcessor) LoadCurrentState(_ context.Context, _ pgx.Tx) error {
+	p.loadCurrentStateCalls++
+	return nil
 }
 
 // setupProtocolCursors inserts protocol cursors into ingest_store.
@@ -2933,6 +2939,70 @@ func Test_PersistLedgerData_ProtocolCASGating(t *testing.T) {
 		mainCursor, err := models.IngestStore.Get(ctx, "latest_ledger_cursor")
 		require.NoError(t, err)
 		assert.Equal(t, uint32(100), mainCursor)
+	})
+
+	t.Run("F: first CAS success calls LoadCurrentState", func(t *testing.T) {
+		processor := &testProtocolProcessor{id: "testproto"}
+		ctx, svc, models, pool := setupTest(t, []ProtocolProcessor{processor})
+		processor.ingestStore = models.IngestStore
+		processor.processedLedger = 100
+		svc.eligibleProtocolProcessors = map[string]ProtocolProcessor{"testproto": processor}
+
+		setupDBCursors(t, ctx, pool, 99, 99)
+		setupProtocolCursors(t, ctx, pool, "testproto", 99, 99)
+
+		buffer := indexer.NewIndexerBuffer()
+		_, _, err := svc.PersistLedgerData(ctx, 100, buffer, "latest_ledger_cursor")
+		require.NoError(t, err)
+
+		// LoadCurrentState should be called exactly once on the handoff ledger
+		assert.Equal(t, 1, processor.loadCurrentStateCalls)
+		// protocolCurrentStateLoaded should be set
+		assert.True(t, svc.protocolCurrentStateLoaded["testproto"])
+	})
+
+	t.Run("G: subsequent CAS success skips LoadCurrentState", func(t *testing.T) {
+		processor := &testProtocolProcessor{id: "testproto"}
+		ctx, svc, models, pool := setupTest(t, []ProtocolProcessor{processor})
+		processor.ingestStore = models.IngestStore
+		svc.eligibleProtocolProcessors = map[string]ProtocolProcessor{"testproto": processor}
+
+		setupDBCursors(t, ctx, pool, 99, 99)
+		setupProtocolCursors(t, ctx, pool, "testproto", 99, 99)
+
+		// First ledger — triggers LoadCurrentState
+		processor.processedLedger = 100
+		buffer := indexer.NewIndexerBuffer()
+		_, _, err := svc.PersistLedgerData(ctx, 100, buffer, "latest_ledger_cursor")
+		require.NoError(t, err)
+		assert.Equal(t, 1, processor.loadCurrentStateCalls)
+
+		// Second ledger — should NOT call LoadCurrentState again
+		processor.processedLedger = 101
+		buffer = indexer.NewIndexerBuffer()
+		_, _, err = svc.PersistLedgerData(ctx, 101, buffer, "latest_ledger_cursor")
+		require.NoError(t, err)
+		assert.Equal(t, 1, processor.loadCurrentStateCalls) // still 1, not 2
+	})
+
+	t.Run("H: CAS lose does not trigger LoadCurrentState", func(t *testing.T) {
+		processor := &testProtocolProcessor{id: "testproto"}
+		ctx, svc, models, pool := setupTest(t, []ProtocolProcessor{processor})
+		processor.ingestStore = models.IngestStore
+		processor.processedLedger = 100
+		svc.eligibleProtocolProcessors = map[string]ProtocolProcessor{"testproto": processor}
+
+		setupDBCursors(t, ctx, pool, 99, 99)
+		// Current state cursor already at 100 — CAS will fail
+		setupProtocolCursors(t, ctx, pool, "testproto", 99, 100)
+
+		buffer := indexer.NewIndexerBuffer()
+		_, _, err := svc.PersistLedgerData(ctx, 100, buffer, "latest_ledger_cursor")
+		require.NoError(t, err)
+
+		// LoadCurrentState should NOT be called since current state CAS failed
+		assert.Equal(t, 0, processor.loadCurrentStateCalls)
+		assert.False(t, svc.protocolCurrentStateLoaded["testproto"])
 	})
 }
 

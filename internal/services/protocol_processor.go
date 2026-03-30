@@ -15,6 +15,12 @@ type ProtocolProcessor interface {
 	ProcessLedger(ctx context.Context, input ProtocolProcessorInput) error
 	PersistHistory(ctx context.Context, dbTx pgx.Tx) error
 	PersistCurrentState(ctx context.Context, dbTx pgx.Tx) error
+	// LoadCurrentState reads the protocol's current state from its state tables
+	// into processor memory. Called once per protocol inside the DB transaction
+	// on the first successful CAS advance of the current_state_cursor (the
+	// handoff moment from migration to live ingestion). Subsequent ledgers use
+	// the in-memory state maintained by PersistCurrentState.
+	LoadCurrentState(ctx context.Context, dbTx pgx.Tx) error
 }
 
 // ProtocolProcessorInput contains the data needed by a processor to analyze a ledger.
