@@ -194,8 +194,13 @@ func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32,
 						}
 						m.metricsService.ObserveProtocolStateProcessingDuration(protocolID, "load_current_state", time.Since(loadStart).Seconds())
 						m.protocolCurrentStateLoaded[protocolID] = true
-						currentStatePersistedProtocols = append(currentStatePersistedProtocols, protocolID)
 					}
+
+					// Any rollback after a successful current-state CAS can leave the
+					// processor's in-memory cache ahead of committed DB state, either
+					// because we just loaded it for handoff or because PersistCurrentState
+					// mutates the write-through cache before a later transactional failure.
+					currentStatePersistedProtocols = append(currentStatePersistedProtocols, protocolID)
 
 					start := time.Now()
 					persistErr := processor.PersistCurrentState(ctx, dbTx)

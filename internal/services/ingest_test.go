@@ -2701,10 +2701,13 @@ func Test_ingestService_processBackfillBatchesParallel_BothModes(t *testing.T) {
 // values into ingest_store within the DB transaction, proving PersistHistory
 // and PersistCurrentState were called and committed atomically.
 type testProtocolProcessor struct {
-	id                    string
-	processedLedger       uint32
-	ingestStore           *data.IngestStoreModel
-	loadCurrentStateCalls int
+	id                         string
+	processedLedger            uint32
+	ingestStore                *data.IngestStoreModel
+	loadCurrentStateCalls      int
+	persistCurrentStateCalls   int
+	failPersistCurrentStateAt  uint32
+	persistCurrentStateVersion int
 }
 
 func (p *testProtocolProcessor) ProtocolID() string { return p.id }
@@ -2719,6 +2722,11 @@ func (p *testProtocolProcessor) PersistHistory(ctx context.Context, dbTx pgx.Tx)
 }
 
 func (p *testProtocolProcessor) PersistCurrentState(ctx context.Context, dbTx pgx.Tx) error {
+	p.persistCurrentStateCalls++
+	p.persistCurrentStateVersion++
+	if p.failPersistCurrentStateAt != 0 && p.processedLedger == p.failPersistCurrentStateAt {
+		return fmt.Errorf("simulated current state persist failure at ledger %d", p.processedLedger)
+	}
 	return p.ingestStore.Update(ctx, dbTx, fmt.Sprintf("test_%s_current_state_written", p.id), p.processedLedger)
 }
 
@@ -3003,6 +3011,42 @@ func Test_PersistLedgerData_ProtocolCASGating(t *testing.T) {
 		// LoadCurrentState should NOT be called since current state CAS failed
 		assert.Equal(t, 0, processor.loadCurrentStateCalls)
 		assert.False(t, svc.protocolCurrentStateLoaded["testproto"])
+	})
+
+	t.Run("I: rollback after later PersistCurrentState failure clears loaded flag for retry", func(t *testing.T) {
+		processor := &testProtocolProcessor{id: "testproto", failPersistCurrentStateAt: 101}
+		ctx, svc, models, pool := setupTest(t, []ProtocolProcessor{processor})
+		processor.ingestStore = models.IngestStore
+		svc.eligibleProtocolProcessors = map[string]ProtocolProcessor{"testproto": processor}
+
+		setupDBCursors(t, ctx, pool, 99, 99)
+		setupProtocolCursors(t, ctx, pool, "testproto", 99, 99)
+
+		// First ledger succeeds and establishes the in-memory cache handoff.
+		processor.processedLedger = 100
+		_, _, err := svc.PersistLedgerData(ctx, 100, indexer.NewIndexerBuffer(), "latest_ledger_cursor")
+		require.NoError(t, err)
+		assert.Equal(t, 1, processor.loadCurrentStateCalls)
+		assert.True(t, svc.protocolCurrentStateLoaded["testproto"])
+
+		// Later ledger mutates in-memory state during PersistCurrentState, then fails.
+		processor.processedLedger = 101
+		_, _, err = svc.PersistLedgerData(ctx, 101, indexer.NewIndexerBuffer(), "latest_ledger_cursor")
+		require.Error(t, err)
+		assert.Equal(t, 2, processor.persistCurrentStateVersion)
+		assert.False(t, svc.protocolCurrentStateLoaded["testproto"])
+
+		currentStateCursor, err := models.IngestStore.Get(ctx, "protocol_testproto_current_state_cursor")
+		require.NoError(t, err)
+		assert.Equal(t, uint32(100), currentStateCursor)
+
+		// Retrying the same ledger should reload current state because the flag was reset.
+		processor.failPersistCurrentStateAt = 0
+		processor.processedLedger = 101
+		_, _, err = svc.PersistLedgerData(ctx, 101, indexer.NewIndexerBuffer(), "latest_ledger_cursor")
+		require.NoError(t, err)
+		assert.Equal(t, 2, processor.loadCurrentStateCalls)
+		assert.True(t, svc.protocolCurrentStateLoaded["testproto"])
 	})
 }
 
