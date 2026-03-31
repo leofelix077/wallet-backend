@@ -12,6 +12,12 @@ import (
 // ProtocolProcessor produces and persists protocol-specific state for a ledger.
 type ProtocolProcessor interface {
 	ProtocolID() string
+	// ProcessLedger analyzes a ledger and stages any per-ledger protocol state
+	// needed by PersistHistory/PersistCurrentState. It runs before any
+	// transaction-scoped LoadCurrentState reload for the ledger, and it may be
+	// called more than once for the same ledger when persistence retries, so
+	// implementations must deterministically rebuild staged state from the
+	// provided input.
 	ProcessLedger(ctx context.Context, input ProtocolProcessorInput) error
 	PersistHistory(ctx context.Context, dbTx pgx.Tx) error
 	PersistCurrentState(ctx context.Context, dbTx pgx.Tx) error

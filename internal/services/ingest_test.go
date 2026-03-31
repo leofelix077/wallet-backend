@@ -1860,7 +1860,7 @@ func Test_ingestProcessedDataWithRetry(t *testing.T) {
 
 		// Call ingestProcessedDataWithRetry - should succeed
 		// Note: assetIDMap and contractIDMap are no longer passed - operations use direct DB queries
-		numTx, numOps, err := svc.ingestProcessedDataWithRetry(ctx, 100, buffer)
+		numTx, numOps, err := svc.ingestProcessedDataWithRetry(ctx, xdr.LedgerCloseMeta{}, 100, buffer)
 
 		// Verify success
 		require.NoError(t, err)
@@ -1950,7 +1950,7 @@ func Test_ingestProcessedDataWithRetry(t *testing.T) {
 
 		// Call ingestProcessedDataWithRetry - should fail after retries due to DB error
 		// Note: assetIDMap and contractIDMap are no longer passed - operations use direct DB queries
-		_, _, err = svc.ingestProcessedDataWithRetry(ctx, 100, buffer)
+		_, _, err = svc.ingestProcessedDataWithRetry(ctx, xdr.LedgerCloseMeta{}, 100, buffer)
 
 		// Verify error propagates with retry failure message
 		require.Error(t, err)
@@ -2048,7 +2048,7 @@ func Test_ingestProcessedDataWithRetry(t *testing.T) {
 
 		// Call ingestProcessedDataWithRetry - should succeed after retry
 		// Note: assetIDMap and contractIDMap are no longer passed - operations use direct DB queries
-		numTx, numOps, err := svc.ingestProcessedDataWithRetry(ctx, 100, buffer)
+		numTx, numOps, err := svc.ingestProcessedDataWithRetry(ctx, xdr.LedgerCloseMeta{}, 100, buffer)
 
 		// Verify success after retry
 		require.NoError(t, err)
@@ -2059,6 +2059,91 @@ func Test_ingestProcessedDataWithRetry(t *testing.T) {
 		finalCursor, err := models.IngestStore.Get(ctx, "latest_ledger_cursor")
 		require.NoError(t, err)
 		assert.Equal(t, uint32(100), finalCursor, "cursor should be updated after successful retry")
+
+		mockTokenIngestionService.AssertExpectations(t)
+	})
+
+	t.Run("rebuilds protocol state on retry", func(t *testing.T) {
+		dbt := dbtest.Open(t)
+		defer dbt.Close()
+		dbConnectionPool, err := db.OpenDBConnectionPool(dbt.DSN)
+		require.NoError(t, err)
+		defer dbConnectionPool.Close()
+
+		ctx := context.Background()
+		initialCursor := uint32(99)
+		setupDBCursors(t, ctx, dbConnectionPool, initialCursor, initialCursor)
+		setupProtocolCursors(t, ctx, dbConnectionPool, "testproto", initialCursor, initialCursor)
+
+		mockMetricsService := metrics.NewMockMetricsService()
+		mockMetricsService.On("RegisterPoolMetrics", "ledger_indexer", mock.Anything).Return()
+		mockMetricsService.On("RegisterPoolMetrics", "backfill", mock.Anything).Return()
+		mockMetricsService.On("ObserveDBQueryDuration", mock.Anything, mock.Anything, mock.Anything).Return().Maybe()
+		mockMetricsService.On("IncDBQuery", mock.Anything, mock.Anything).Return().Maybe()
+		mockMetricsService.On("ObserveProtocolStateProcessingDuration", mock.Anything, mock.Anything, mock.Anything).Return().Maybe()
+		defer mockMetricsService.AssertExpectations(t)
+
+		models, err := data.NewModels(dbConnectionPool, mockMetricsService)
+		require.NoError(t, err)
+
+		mockRPCService := &RPCServiceMock{}
+		mockRPCService.On("NetworkPassphrase").Return(network.TestNetworkPassphrase).Maybe()
+
+		mockTokenIngestionService := NewTokenIngestionServiceMock(t)
+		mockTokenIngestionService.On("ProcessTokenChanges",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(fmt.Errorf("transient error")).Once()
+		mockTokenIngestionService.On("ProcessTokenChanges",
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+			mock.Anything,
+		).Return(nil).Once()
+
+		processor := &testProtocolProcessor{id: "testproto"}
+		svc, err := NewIngestService(IngestServiceConfig{
+			IngestionMode:          IngestionModeLive,
+			Models:                 models,
+			LatestLedgerCursorName: "latest_ledger_cursor",
+			OldestLedgerCursorName: "oldest_ledger_cursor",
+			AppTracker:             &apptracker.MockAppTracker{},
+			RPCService:             mockRPCService,
+			LedgerBackend:          &LedgerBackendMock{},
+			ChannelAccountStore:    &store.ChannelAccountStoreMock{},
+			TokenIngestionService:  mockTokenIngestionService,
+			MetricsService:         mockMetricsService,
+			GetLedgersLimit:        defaultGetLedgersLimit,
+			Network:                network.TestNetworkPassphrase,
+			NetworkPassphrase:      network.TestNetworkPassphrase,
+			Archive:                &HistoryArchiveMock{},
+			ProtocolProcessors:     []ProtocolProcessor{processor},
+		})
+		require.NoError(t, err)
+
+		processor.ingestStore = models.IngestStore
+		svc.protocolContractCache = nil
+		svc.SetEligibleProtocolProcessorsForTest(map[string]ProtocolProcessor{"testproto": processor})
+
+		numTx, numOps, err := svc.ingestProcessedDataWithRetry(ctx, xdr.LedgerCloseMeta{}, 100, indexer.NewIndexerBuffer())
+		require.NoError(t, err)
+		assert.Equal(t, 0, numTx)
+		assert.Equal(t, 0, numOps)
+
+		assert.Equal(t, 2, processor.processLedgerCalls)
+		assert.Equal(t, 1, processor.loadCurrentStateCalls)
+		assert.Equal(t, 1, processor.persistCurrentStateCalls)
+		assert.True(t, svc.protocolCurrentStateLoaded["testproto"])
+
+		currentStateCursor, err := models.IngestStore.Get(ctx, "protocol_testproto_current_state_cursor")
+		require.NoError(t, err)
+		assert.Equal(t, uint32(100), currentStateCursor)
 
 		mockTokenIngestionService.AssertExpectations(t)
 	})
@@ -2702,6 +2787,7 @@ func Test_ingestService_processBackfillBatchesParallel_BothModes(t *testing.T) {
 // and PersistCurrentState were called and committed atomically.
 type testProtocolProcessor struct {
 	id                         string
+	processLedgerCalls         int
 	processedLedger            uint32
 	ingestStore                *data.IngestStoreModel
 	loadCurrentStateCalls      int
@@ -2713,6 +2799,7 @@ type testProtocolProcessor struct {
 func (p *testProtocolProcessor) ProtocolID() string { return p.id }
 
 func (p *testProtocolProcessor) ProcessLedger(_ context.Context, input ProtocolProcessorInput) error {
+	p.processLedgerCalls++
 	p.processedLedger = input.LedgerSequence
 	return nil
 }

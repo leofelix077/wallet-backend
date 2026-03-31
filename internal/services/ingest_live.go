@@ -347,15 +347,9 @@ func (m *ingestService) ingestLiveLedgers(ctx context.Context, startLedger uint3
 		}
 		m.eligibleProtocolProcessors = eligibleProcessors
 
-		// Run protocol state production (in-memory analysis before DB transaction) only
-		// for processors that may actually persist this ledger.
-		if produceErr := m.produceProtocolStateForProcessors(ctx, ledgerMeta, currentLedger, eligibleProcessors); produceErr != nil {
-			return fmt.Errorf("producing protocol state for ledger %d: %w", currentLedger, produceErr)
-		}
-
 		// All DB operations in a single atomic transaction with retry
 		dbStart := time.Now()
-		numTransactionProcessed, numOperationProcessed, err := m.ingestProcessedDataWithRetry(ctx, currentLedger, buffer)
+		numTransactionProcessed, numOperationProcessed, err := m.ingestProcessedDataWithRetry(ctx, ledgerMeta, currentLedger, buffer)
 		if err != nil {
 			return fmt.Errorf("processing ledger %d: %w", currentLedger, err)
 		}
@@ -477,13 +471,19 @@ func (m *ingestService) refreshProtocolContractCache(ctx context.Context, curren
 }
 
 // ingestProcessedDataWithRetry wraps PersistLedgerData with retry logic.
-func (m *ingestService) ingestProcessedDataWithRetry(ctx context.Context, currentLedger uint32, buffer *indexer.IndexerBuffer) (int, int, error) {
+// Protocol state is re-produced on every attempt so processor-owned staged state
+// is rebuilt after rolled-back transactions.
+func (m *ingestService) ingestProcessedDataWithRetry(ctx context.Context, ledgerMeta xdr.LedgerCloseMeta, currentLedger uint32, buffer *indexer.IndexerBuffer) (int, int, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxIngestProcessedDataRetries; attempt++ {
 		select {
 		case <-ctx.Done():
 			return 0, 0, fmt.Errorf("context cancelled: %w", ctx.Err())
 		default:
+		}
+
+		if produceErr := m.produceProtocolStateForProcessors(ctx, ledgerMeta, currentLedger, m.eligibleProtocolProcessors); produceErr != nil {
+			return 0, 0, fmt.Errorf("producing protocol state for ledger %d: %w", currentLedger, produceErr)
 		}
 
 		numTxs, numOps, err := m.PersistLedgerData(ctx, currentLedger, buffer, m.latestLedgerCursorName)

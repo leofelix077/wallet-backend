@@ -125,9 +125,10 @@ type ingestService struct {
 	knownContractIDs          set.Set[string]
 	protocolProcessors        map[string]ProtocolProcessor
 	protocolContractCache     *protocolContractCache
-	// eligibleProtocolProcessors is set by ingestLiveLedgers before each call
-	// to PersistLedgerData, scoping the CAS loop to only processors that had
-	// ProcessLedger called. Only accessed from the single-threaded live ingestion loop.
+	// eligibleProtocolProcessors is set by ingestLiveLedgers before each retry
+	// sequence, scoping protocol processing and the CAS loop to processors that
+	// may persist the current ledger. Only accessed from the single-threaded live
+	// ingestion loop.
 	eligibleProtocolProcessors map[string]ProtocolProcessor
 	// protocolCurrentStateLoaded tracks which protocols have had their current
 	// state loaded into processor memory via LoadCurrentState. On the first
@@ -139,7 +140,7 @@ type ingestService struct {
 }
 
 // SetEligibleProtocolProcessorsForTest sets the eligible protocol processors for testing.
-// In production, this is set by ingestLiveLedgers before each PersistLedgerData call.
+// In production, this is set by ingestLiveLedgers before each retry sequence.
 func (m *ingestService) SetEligibleProtocolProcessorsForTest(processors map[string]ProtocolProcessor) {
 	m.eligibleProtocolProcessors = processors
 }
