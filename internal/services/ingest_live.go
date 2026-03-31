@@ -491,6 +491,9 @@ func (m *ingestService) ingestProcessedDataWithRetry(ctx context.Context, ledger
 			return numTxs, numOps, nil
 		}
 		lastErr = err
+		if attempt == maxIngestProcessedDataRetries-1 {
+			break
+		}
 
 		backoff := time.Duration(1<<attempt) * time.Second
 		if backoff > maxIngestProcessedDataRetryBackoff {
