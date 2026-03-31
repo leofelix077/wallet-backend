@@ -22,10 +22,13 @@ type ProtocolProcessor interface {
 	PersistHistory(ctx context.Context, dbTx pgx.Tx) error
 	PersistCurrentState(ctx context.Context, dbTx pgx.Tx) error
 	// LoadCurrentState reads the protocol's current state from its state tables
-	// into processor memory. Called once per protocol inside the DB transaction
-	// on the first successful CAS advance of the current_state_cursor (the
-	// handoff moment from migration to live ingestion). Subsequent ledgers use
-	// the in-memory state maintained by PersistCurrentState.
+	// into processor memory. Called inside the DB transaction on the first
+	// successful CAS advance of the current_state_cursor (the handoff moment
+	// from migration to live ingestion). It may be called again after a
+	// rollback resets the loaded flag, so implementations must be safe to
+	// invoke multiple times — each call should fully replace in-memory state
+	// from the DB. Between successful loads, subsequent ledgers use the
+	// in-memory state maintained by PersistCurrentState.
 	LoadCurrentState(ctx context.Context, dbTx pgx.Tx) error
 }
 
