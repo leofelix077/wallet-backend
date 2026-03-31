@@ -194,6 +194,7 @@ func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32,
 						}
 						m.metricsService.ObserveProtocolStateProcessingDuration(protocolID, "load_current_state", time.Since(loadStart).Seconds())
 						m.protocolCurrentStateLoaded[protocolID] = true
+						currentStatePersistedProtocols = append(currentStatePersistedProtocols, protocolID)
 					}
 
 					start := time.Now()
@@ -202,7 +203,6 @@ func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32,
 					if persistErr != nil {
 						return fmt.Errorf("persisting current state for %s at ledger %d: %w", protocolID, ledgerSeq, persistErr)
 					}
-					currentStatePersistedProtocols = append(currentStatePersistedProtocols, protocolID)
 				}
 			}
 		}
@@ -215,9 +215,9 @@ func (m *ingestService) PersistLedgerData(ctx context.Context, ledgerSeq uint32,
 		return nil
 	})
 	if err != nil {
-		// Transaction rolled back — processor in-memory state may be stale from
-		// the failed PersistCurrentState call. Reset loaded flags to force a
-		// DB reload on the next successful CAS attempt.
+		// Transaction rolled back — processor in-memory state loaded inside the
+		// rolled-back transaction may not match the committed DB state. Reset
+		// loaded flags to force a DB reload on the next successful CAS attempt.
 		for _, pid := range currentStatePersistedProtocols {
 			m.protocolCurrentStateLoaded[pid] = false
 		}
