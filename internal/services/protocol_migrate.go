@@ -57,6 +57,7 @@ type migrationStrategy struct {
 type protocolMigrateEngine struct {
 	db                     db.ConnectionPool
 	ledgerBackend          ledgerbackend.LedgerBackend
+	ledgerBackendFactory   func() ledgerbackend.LedgerBackend
 	protocolsModel         data.ProtocolsModelInterface
 	protocolContractsModel data.ProtocolContractsModelInterface
 	ingestStore            *data.IngestStoreModel
@@ -64,6 +65,22 @@ type protocolMigrateEngine struct {
 	processors             map[string]ProtocolProcessor
 	latestLedgerCursorName string
 	strategy               migrationStrategy
+}
+
+// resetLedgerBackend closes the current backend and creates a fresh one.
+// RPCLedgerBackend does not support calling PrepareRange more than once,
+// so the backend must be recreated between range preparations.
+// No-op when no factory is configured (e.g. in tests using mock backends).
+func (s *protocolMigrateEngine) resetLedgerBackend(ctx context.Context) {
+	if s.ledgerBackendFactory == nil {
+		return
+	}
+	if s.ledgerBackend != nil {
+		if err := s.ledgerBackend.Close(); err != nil {
+			log.Ctx(ctx).Warnf("error closing ledger backend during reset: %v", err)
+		}
+	}
+	s.ledgerBackend = s.ledgerBackendFactory()
 }
 
 // Run performs migration for the given protocol IDs using the configured strategy.
@@ -260,6 +277,9 @@ func (s *protocolMigrateEngine) processAllProtocols(ctx context.Context, protoco
 
 		log.Ctx(ctx).Infof("Processing ledgers %d to %d for %d protocol(s)", startLedger, latestLedger, len(protocolIDs))
 
+		// RPCLedgerBackend does not support re-preparing; close and recreate.
+		s.resetLedgerBackend(ctx)
+
 		if prepErr := s.ledgerBackend.PrepareRange(ctx, ledgerbackend.BoundedRange(startLedger, latestLedger)); prepErr != nil {
 			return handedOffProtocolIDs(trackers), fmt.Errorf("preparing ledger range [%d, %d]: %w", startLedger, latestLedger, prepErr)
 		}
@@ -364,6 +384,7 @@ func (s *protocolMigrateEngine) processAllProtocols(ctx context.Context, protoco
 		}
 
 		// At tip — poll briefly for convergence.
+		s.resetLedgerBackend(ctx)
 		pollCtx, cancel := context.WithTimeout(ctx, convergencePollTimeout)
 		prepErr := s.ledgerBackend.PrepareRange(pollCtx, ledgerbackend.UnboundedRange(latestLedger+1))
 		if prepErr != nil {

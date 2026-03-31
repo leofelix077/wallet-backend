@@ -27,6 +27,7 @@ type protocolMigrateHistoryService struct {
 type ProtocolMigrateHistoryConfig struct {
 	DB                     db.ConnectionPool
 	LedgerBackend          ledgerbackend.LedgerBackend
+	LedgerBackendFactory   func() ledgerbackend.LedgerBackend
 	ProtocolsModel         data.ProtocolsModelInterface
 	ProtocolContractsModel data.ProtocolContractsModelInterface
 	IngestStore            *data.IngestStoreModel
@@ -65,6 +66,7 @@ func NewProtocolMigrateHistoryService(cfg ProtocolMigrateHistoryConfig) (*protoc
 		engine: protocolMigrateEngine{
 			db:                     cfg.DB,
 			ledgerBackend:          cfg.LedgerBackend,
+			ledgerBackendFactory:   cfg.LedgerBackendFactory,
 			protocolsModel:         cfg.ProtocolsModel,
 			protocolContractsModel: cfg.ProtocolContractsModel,
 			ingestStore:            cfg.IngestStore,

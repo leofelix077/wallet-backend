@@ -123,6 +123,7 @@ func runMigration(
 		ctx context.Context,
 		dbPool db.ConnectionPool,
 		ledgerBackend ledgerbackend.LedgerBackend,
+		ledgerBackendFactory func() ledgerbackend.LedgerBackend,
 		models *data.Models,
 		processors []services.ProtocolProcessor,
 	) error,
@@ -161,18 +162,23 @@ func runMigration(
 		return fmt.Errorf("creating models: %w", err)
 	}
 
-	// Create ledger backend
-	ledgerBackend := ledgerbackend.NewRPCLedgerBackend(ledgerbackend.RPCLedgerBackendOptions{
-		RPCServerURL: opts.rpcURL,
-		BufferSize:   10,
-	})
+	// Create ledger backend factory for re-creating backends between range preparations.
+	// RPCLedgerBackend does not support calling PrepareRange more than once.
+	newBackend := func() ledgerbackend.LedgerBackend {
+		return ledgerbackend.NewRPCLedgerBackend(ledgerbackend.RPCLedgerBackendOptions{
+			RPCServerURL: opts.rpcURL,
+			BufferSize:   10,
+		})
+	}
+
+	ledgerBackend := newBackend()
 	defer func() {
 		if closeErr := ledgerBackend.Close(); closeErr != nil {
 			log.Ctx(ctx).Errorf("error closing ledger backend: %v", closeErr)
 		}
 	}()
 
-	return createAndRun(ctx, dbPool, ledgerBackend, models, processors)
+	return createAndRun(ctx, dbPool, ledgerBackend, newBackend, models, processors)
 }
 
 func (c *protocolMigrateCmd) historyCommand() *cobra.Command {
@@ -187,10 +193,11 @@ func (c *protocolMigrateCmd) historyCommand() *cobra.Command {
 		},
 		nil,
 		func(opts *migrationCommandOpts) error {
-			return runMigration("history", opts, func(ctx context.Context, dbPool db.ConnectionPool, ledgerBackend ledgerbackend.LedgerBackend, models *data.Models, processors []services.ProtocolProcessor) error {
+			return runMigration("history", opts, func(ctx context.Context, dbPool db.ConnectionPool, ledgerBackend ledgerbackend.LedgerBackend, ledgerBackendFactory func() ledgerbackend.LedgerBackend, models *data.Models, processors []services.ProtocolProcessor) error {
 				service, err := services.NewProtocolMigrateHistoryService(services.ProtocolMigrateHistoryConfig{
 					DB:                     dbPool,
 					LedgerBackend:          ledgerBackend,
+					LedgerBackendFactory:   ledgerBackendFactory,
 					ProtocolsModel:         models.Protocols,
 					ProtocolContractsModel: models.ProtocolContracts,
 					IngestStore:            models.IngestStore,
@@ -228,10 +235,11 @@ func (c *protocolMigrateCmd) currentStateCommand() *cobra.Command {
 			return nil
 		},
 		func(opts *migrationCommandOpts) error {
-			return runMigration("current-state", opts, func(ctx context.Context, dbPool db.ConnectionPool, ledgerBackend ledgerbackend.LedgerBackend, models *data.Models, processors []services.ProtocolProcessor) error {
+			return runMigration("current-state", opts, func(ctx context.Context, dbPool db.ConnectionPool, ledgerBackend ledgerbackend.LedgerBackend, ledgerBackendFactory func() ledgerbackend.LedgerBackend, models *data.Models, processors []services.ProtocolProcessor) error {
 				service, err := services.NewProtocolMigrateCurrentStateService(services.ProtocolMigrateCurrentStateConfig{
 					DB:                     dbPool,
 					LedgerBackend:          ledgerBackend,
+					LedgerBackendFactory:   ledgerBackendFactory,
 					ProtocolsModel:         models.Protocols,
 					ProtocolContractsModel: models.ProtocolContracts,
 					IngestStore:            models.IngestStore,
