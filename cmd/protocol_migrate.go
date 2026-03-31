@@ -171,14 +171,7 @@ func runMigration(
 		})
 	}
 
-	ledgerBackend := newBackend()
-	defer func() {
-		if closeErr := ledgerBackend.Close(); closeErr != nil {
-			log.Ctx(ctx).Errorf("error closing ledger backend: %v", closeErr)
-		}
-	}()
-
-	return createAndRun(ctx, dbPool, ledgerBackend, newBackend, models, processors)
+	return createAndRun(ctx, dbPool, newBackend(), newBackend, models, processors)
 }
 
 func (c *protocolMigrateCmd) historyCommand() *cobra.Command {

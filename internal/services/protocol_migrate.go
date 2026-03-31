@@ -83,8 +83,18 @@ func (s *protocolMigrateEngine) resetLedgerBackend(ctx context.Context) {
 	s.ledgerBackend = s.ledgerBackendFactory()
 }
 
+// closeLedgerBackend closes the current backend instance held by the engine.
+func (s *protocolMigrateEngine) closeLedgerBackend(ctx context.Context) {
+	if s.ledgerBackend != nil {
+		if err := s.ledgerBackend.Close(); err != nil {
+			log.Ctx(ctx).Warnf("error closing ledger backend: %v", err)
+		}
+	}
+}
+
 // Run performs migration for the given protocol IDs using the configured strategy.
 func (s *protocolMigrateEngine) Run(ctx context.Context, protocolIDs []string) error {
+	defer s.closeLedgerBackend(ctx)
 	// Phase 1: Validate
 	activeProtocolIDs, err := s.validate(ctx, protocolIDs)
 	if err != nil {
